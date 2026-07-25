@@ -127,14 +127,42 @@ static void apply_font(void) {
     fz_set_use_document_css(ctx, fonts[font_sel].builtin && fonts[font_sel].css[0] == 0);
 }
 
+/* Reading themes. Light passes original colors through (images stay true).
+ * Sepia/Dark map each pixel's luminance across a two-tone page->ink ramp, which
+ * reads cleanly for text and gives a classic e-reader tint on the whole page. */
+enum { TH_LIGHT, TH_SEPIA, TH_DARK, TH_N };
+static int theme = TH_LIGHT;
+static const char *theme_name[TH_N] = { "Light", "Sepia", "Dark" };
+/* ramp[theme] = { page{r,g,b} at luma 255, ink{r,g,b} at luma 0 } */
+static const unsigned char ramp[TH_N][2][3] = {
+    { {255,255,255}, {  0,  0,  0} },   /* light (mapping skipped) */
+    { {244,236,216}, { 91, 64, 40} },   /* sepia: cream page, brown ink */
+    { { 24, 24, 26}, {212,212,208} },   /* dark: near-black page, warm grey ink */
+};
+static inline uint16_t rgb565(int r, int g, int b) {
+    return (uint16_t)(((r&0xF8)<<8)|((g&0xFC)<<3)|(b>>3));
+}
+static uint16_t bg565(void) {
+    const unsigned char *p = ramp[theme][0];
+    return theme == TH_LIGHT ? 0xFFFF : rgb565(p[0], p[1], p[2]);
+}
 static void pix_to_fb(const fz_pixmap *pix) {
     int W = pix->w < PW ? pix->w : PW, H = pix->h < PH ? pix->h : PH;
-    memset(FB, 0xFF, (size_t)PW*PH*2);
+    uint16_t fill = bg565();
+    for (size_t i = 0; i < (size_t)PW*PH; i++) FB[i] = fill;
     for (int y = 0; y < H; y++) {
         const unsigned char *s = pix->samples + (size_t)y*pix->stride;
         uint16_t *d = FB + (size_t)y*PW;
         for (int x = 0; x < W; x++) {
-            d[x] = (uint16_t)(((s[0]&0xF8)<<8)|((s[1]&0xFC)<<3)|(s[2]>>3));
+            int r = s[0], g = s[1], b = s[2];
+            if (theme != TH_LIGHT) {
+                int L = (r*77 + g*150 + b*29) >> 8;      /* luma 0..255 */
+                const unsigned char *bg = ramp[theme][0], *ink = ramp[theme][1];
+                r = ink[0] + (bg[0]-ink[0])*L/255;
+                g = ink[1] + (bg[1]-ink[1])*L/255;
+                b = ink[2] + (bg[2]-ink[2])*L/255;
+            }
+            d[x] = rgb565(r, g, b);
             s += pix->n;
         }
     }
@@ -175,17 +203,18 @@ static void pos_init(const char *book) { snprintf(pos_path, sizeof pos_path, "%s
 static void pos_load(void) {
     FILE *f = fopen(pos_path, "r");
     if (!f) return;
-    int p, px = 0, fs = 0;
-    int n = fscanf(f, "%d %d %d", &p, &px, &fs);
+    int p, px = 0, fs = 0, th = 0;
+    int n = fscanf(f, "%d %d %d %d", &p, &px, &fs, &th);
     if (n >= 1) page = p;
     if (n >= 2 && px >= PX_MIN && px <= PX_MAX) font_px = px;
     if (n >= 3 && fs >= 0 && fs < font_count) font_sel = fs;
+    if (n >= 4 && th >= 0 && th < TH_N) theme = th;
     fclose(f);
 }
 static void pos_save(void) {
     FILE *f = fopen(pos_path, "w");
     if (!f) return;
-    fprintf(f, "%d %d %d\n", page, font_px, font_sel);
+    fprintf(f, "%d %d %d %d\n", page, font_px, font_sel, theme);
     fclose(f);
 }
 
@@ -194,7 +223,7 @@ static void pos_save(void) {
  *   VALUE rows (Text size, Font)  -> LEFT/RIGHT change the value in place.
  *   ACTION rows (Resume/jump/...) -> A activates.
  */
-enum { M_SIZE, M_FONT, M_RESUME, M_FWD, M_BACK, M_START, M_END, M_QUIT, M_N };
+enum { M_SIZE, M_FONT, M_THEME, M_RESUME, M_FWD, M_BACK, M_START, M_END, M_QUIT, M_N };
 
 static void draw_status(void) {
     char s[96];
@@ -209,6 +238,7 @@ static void menu_label(int i, char *out, size_t n) {
     switch (i) {
     case M_SIZE:   snprintf(out, n, "< Text size: %d px >", font_px); break;
     case M_FONT:   snprintf(out, n, "< Font: %s >", fonts[font_sel].name); break;
+    case M_THEME:  snprintf(out, n, "< Theme: %s >", theme_name[theme]); break;
     case M_RESUME: snprintf(out, n, "Resume"); break;
     case M_FWD:    snprintf(out, n, "Jump forward  (+10%%)"); break;
     case M_BACK:   snprintf(out, n, "Jump back     (-10%%)"); break;
@@ -262,6 +292,10 @@ static int menu_loop(void) {
             } else if (sel == M_FONT) {
                 font_sel = (font_sel + dir + font_count) % font_count;
                 apply_font(); dirty = 1; redraw = 1;   /* CSS now, reflow on close */
+            } else if (sel == M_THEME) {
+                theme = (theme + dir + TH_N) % TH_N;   /* color only: no reflow,
+                                                          page re-renders on close */
+                redraw = 1;
             }
         }
 
