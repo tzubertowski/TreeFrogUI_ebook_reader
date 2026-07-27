@@ -52,7 +52,7 @@ enum {
   K_Y = 15
 };
 #define BIT(b) (1u << (b))
-#define STATUS_H 24
+#define STATUS_H 30
 
 static volatile uint32_t *g_keys;
 static int PW = 854, PH = 480; /* panel pixels */
@@ -158,6 +158,7 @@ static void add_builtin(const char *name, const char *family) {
     e->css[0] = 0;
   e->builtin = 1;
 }
+
 static void scan_font_dir(const char *dir) {
   DIR *d = opendir(dir);
   if (!d)
@@ -177,6 +178,7 @@ static void scan_font_dir(const char *dir) {
   }
   closedir(d);
 }
+
 static void fonts_init(void) {
   add_builtin("Serif (default)", "");
   add_builtin("Sans", "sans-serif");
@@ -240,7 +242,7 @@ static void pix_to_fb(const fz_pixmap *pix) {
   int H = pix->h < usable_h ? pix->h : usable_h;
 
   int xoff = (PW - W) / 2;
-  int yoff = (usable_h - H) / 2;
+  int yoff = 4;
 
   uint16_t fill = bg565();
 
@@ -309,7 +311,8 @@ static void reflow(void) {
   splash("Reflowing...");
   float frac = count > 1 ? (float)page / (count - 1) : 0;
   fz_try(ctx) {
-    fz_layout_document(ctx, doc, (float)PW, (float)PH, em_from_px());
+    fz_layout_document(ctx, doc, (float)PW, (float)(PH - STATUS_H),
+                       em_from_px());
     count = fz_count_pages(ctx, doc);
   }
   fz_catch(ctx) { fz_report_error(ctx); }
@@ -400,9 +403,8 @@ static void draw_status(void) {
   int pct = count > 1 ? page * 100 / (count - 1) : 100;
   snprintf(s, sizeof s, "Page %d / %d   %d%%   [SELECT] menu", page + 1, count,
            pct);
-  int bh = 8 * UIS + 6;
-  fill_rect(0, PH - bh, PW, bh, 0x0000);
-  put_text(6, PH - bh + 3, UIS, s, 0xFFFF);
+  fill_rect(0, PH - STATUS_H, PW, STATUS_H, 0x0000);
+  put_text(6, PH - STATUS_H + 3, UIS, s, 0xFFFF);
 }
 
 static void menu_label(int i, char *out, size_t n) {
@@ -608,7 +610,8 @@ int main(int argc, char **argv) {
     pos_load(); /* may set font_px + font_sel first */
     build_theme_lut();
     apply_font();
-    fz_layout_document(ctx, doc, (float)PW, (float)PH, em_from_px());
+    fz_layout_document(ctx, doc, (float)PW, (float)(PH - STATUS_H),
+                       em_from_px());
     count = fz_count_pages(ctx, doc);
   }
   fz_catch(ctx) {
