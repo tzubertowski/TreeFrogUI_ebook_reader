@@ -55,9 +55,11 @@ enum {
 #define STATUS_H 30
 
 static volatile uint32_t *g_keys;
-static int PW = 854, PH = 480; /* panel pixels */
+/* Panel pixels */
+static int PW = 854, PH = 480;
 
-static uint16_t *FB; /* PW*PH RGB565 */
+/* PW*PH RGB565 */
+static uint16_t *FB;
 
 static void input_init(void) {
   key_t k = ftok("/tmp/joy_key", 'a');
@@ -73,8 +75,7 @@ static void input_init(void) {
 
 static uint32_t keys(void) { return g_keys ? (*g_keys & 0xFFFF) : 0; }
 
-/* ---- tiny 8x8 UI text (menu/status), scaled --------------------------------
- */
+/* Tiny 8x8 UI text (menu/status), scaled. */
 static void put_char(int x, int y, int sc, char c, uint16_t col) {
   if ((unsigned char)c >= 128)
     c = '?';
@@ -122,24 +123,27 @@ static uint64_t ticks_ms(void) {
   return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* ---- MuPDF -----------------------------------------------------------------
- */
+/* MuPDF */
 static fz_context *ctx;
 static fz_colorspace *rgb;
 static fz_document *doc;
 static int page = 0, count = 1;
 static int pos_dirty = 0;
 
-/* ---- font size (stored as on-panel px; render em is 1.5x since we render at
- * 720 tall and the panel is 480 tall) ------------------------------------- */
+/*
+ * Font size (stored as on-panel px; render em is 1.5x since we render at
+ * 720 tall and the panel is 480 tall)
+ */
 static int font_px = 24; /* what the user sets/sees */
 #define PX_MIN 12
 #define PX_MAX 48
 static float em_from_px(void) { return font_px * 720.0f / 480.0f; }
 
-/* ---- font face: built-in serif/sans/mono + any TTF/OTF dropped in a fonts
+/*
+ * Font face: built-in serif/sans/mono + any TTF/OTF dropped in a fonts
  * dir. Custom faces are injected via an @font-face user CSS pointing at the
- * absolute file path. ------------------------------------------------------ */
+ * absolute file path.
+ */
 typedef struct {
   char name[48];
   char css[512];
@@ -195,7 +199,8 @@ static void apply_font(void) {
                                    fonts[font_sel].css[0] == 0);
 }
 
-/* Reading themes. Light passes original colors through (images stay true).
+/*
+ * Reading themes. Light passes original colors through (images stay true).
  * Sepia/Dark map each pixel's luminance across a two-tone page->ink ramp, which
  * reads cleanly for text and gives a classic e-reader tint on the whole page.
  */
@@ -270,8 +275,9 @@ static void pix_to_fb(const fz_pixmap *pix) {
 }
 static void present(void) { hwdisp_present(FB, PW, PH, PW * 2); }
 
-#define UIS                                                                    \
-  3 /* 8x8 UI font scale at 1280x720 (24px glyphs -> ~12px on panel) */
+/* 8x8 UI font scale at 1280x720 (24px glyphs -> ~12px on panel) */
+#define UIS 3
+
 static void splash(const char *msg) {
   memset(FB, 0x00, (size_t)PW * PH * 2);
   put_text(PW / 2 - (int)strlen(msg) * 4 * UIS, PH / 2 - 4 * UIS, UIS, msg,
@@ -323,8 +329,7 @@ static void reflow(void) {
     page = count - 1;
 }
 
-/* ---- progress persistence --------------------------------------------------
- */
+/* Progress persistence */
 static char pos_path[1100];
 
 static void pos_init(const char *book) {
@@ -380,7 +385,8 @@ static void pos_save(void) {
   rename(tmp, pos_path);
 }
 
-/* ---- menu ------------------------------------------------------------------
+/*
+ * ---- Menu --------------------------------------------------------------
  * Two row kinds:
  *   VALUE rows (Text size, Font)  -> LEFT/RIGHT change the value in place.
  *   ACTION rows (Resume/jump/...) -> A activates.
@@ -443,9 +449,11 @@ static void menu_label(int i, char *out, size_t n) {
 
 /* returns: 0 stay, 1 quit */
 static int menu_loop(void) {
-  int sel = 0, redraw = 1,
-      dirty = 0; /* dirty: size/font changed, reflow on exit */
-  /* Render page + dim into a bg buffer once (the dimmed page is just backdrop;
+  /* dirty: size/font changed, reflow on exit */
+  int sel = 0, redraw = 1, dirty = 0;
+
+  /*
+   * Render page + dim into a bg buffer once (the dimmed page is just backdrop;
    * size/font changes only reflow when you LEAVE the menu, not per keypress).
    */
   uint16_t *bg = malloc((size_t)PW * PH * 2);
@@ -458,6 +466,7 @@ static int menu_loop(void) {
       bg[i] = (FB[i] >> 1) & 0x7BEF;
   const int rowh = 8 * UIS + 12;
   const int bw = 8 * UIS * 26;
+
 #define MENU_CLOSE()                                                           \
   do {                                                                         \
     if (dirty)                                                                 \
@@ -465,6 +474,7 @@ static int menu_loop(void) {
     free(bg);                                                                  \
     return 0;                                                                  \
   } while (0)
+
   uint32_t prev = keys();
   for (;;) {
     if (redraw) {
@@ -509,8 +519,10 @@ static int menu_loop(void) {
       }
     }
 
-    /* LEFT/RIGHT adjust value rows in place - value + label update now, the
-     * (slow) reflow is deferred until the menu closes. */
+    /*
+     * LEFT/RIGHT adjust value rows in place - value + label update now, the
+     * (slow) reflow is deferred until the menu closes.
+     */
     if (pr & (BIT(K_LEFT) | BIT(K_RIGHT))) {
       int dir = (pr & BIT(K_RIGHT)) ? 1 : -1;
       if (sel == M_SIZE) {
@@ -526,8 +538,8 @@ static int menu_loop(void) {
         dirty = 1;
         redraw = 1; /* CSS now, reflow on close */
       } else if (sel == M_THEME) {
-        theme = (theme + dir + TH_N) % TH_N; /* color only: no reflow,
-                                                page re-renders on close */
+        /* color only: no reflow, page re-renders on close */
+        theme = (theme + dir + TH_N) % TH_N;
         redraw = 1;
       }
     }
@@ -576,12 +588,14 @@ int main(int argc, char **argv) {
   }
   const char *path = argv[1];
 
-  /* Render at the driver's NATIVE 1280x720 and present it 1:1 - the driver
+  /*
+   * Render at the driver's NATIVE 1280x720 and present it 1:1 - the driver
    * then scales that single fixed size down to whatever panel this device has.
    * Device-agnostic (R36SX / SF3000 / SF3500), and 1280x720 is the only size
    * proven safe on every driver: odd aspect-pad widths (853) hang R36SX, and
    * a smaller source integer-scales to a tiny centered square. No pad, no
-   * per-axis surprise. */
+   * per-axis surprise.
+   */
   PW = 1280;
   PH = 720;
 
@@ -589,8 +603,11 @@ int main(int argc, char **argv) {
     fprintf(stderr, "hwdisp_init failed\n");
     return 1;
   }
-  hwdisp_set_target_aspect(0, 0); /* passthrough: hand the driver 1280x720 */
-  hwdisp_set_filter(0);           /* HW bilinear downscale to the panel */
+  /* passthrough: hand the driver 1280x720 */
+  hwdisp_set_target_aspect(0, 0);
+  /* HW bilinear downscale to the panel */
+  hwdisp_set_filter(0);
+
   input_init();
 
   FB = malloc((size_t)PW * PH * 2);
@@ -606,8 +623,11 @@ int main(int argc, char **argv) {
   fz_try(ctx) {
     fz_register_document_handlers(ctx);
     doc = fz_open_document(ctx, path);
+
     pos_init(path);
-    pos_load(); /* may set font_px + font_sel first */
+    /* may set font_px + font_sel first */
+    pos_load();
+
     build_theme_lut();
     apply_font();
     fz_layout_document(ctx, doc, (float)PW, (float)(PH - STATUS_H),
@@ -697,9 +717,11 @@ int main(int argc, char **argv) {
     usleep(15000);
   }
 
-  /* Fast exit: fz_drop_document/context walks and frees the whole font/page
+  /*
+   * Fast exit: fz_drop_document/context walks and frees the whole font/page
    * store, which is SLOW on this CPU for a big epub. We're quitting anyway, so
-   * save progress, release the display, and let the kernel reclaim memory. */
+   * save progress, release the display, and let the kernel reclaim memory.
+   */
   splash("Exiting...");
   if (pos_dirty)
     pos_save();
