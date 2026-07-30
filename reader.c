@@ -25,6 +25,7 @@
 #include <strings.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <sys/time.h>
 
 #include "port_sf3000/hwdisp.h"
 #include "font8x8.h"
@@ -75,6 +76,12 @@ static void fill_rect(int x, int y, int w, int h, uint16_t col) {
 static fz_context *ctx;
 static fz_document *doc;
 static int page = 0, count = 1;
+
+/* The SF3000 is memory constrained. MuPDF's unlimited store keeps decoded
+ * images and fonts from every visited EPUB page until exit, eventually pushing
+ * the device into swap/thrashing. Keep the useful cache, but put a hard ceiling
+ * on it so long/image-heavy books stay responsive. */
+#define EBOOK_STORE_BYTES (16u << 20)
 
 /* ---- font size (stored as on-panel px; render em is 1.5x since we render at
  * 720 tall and the panel is 480 tall) ------------------------------------- */
@@ -139,8 +146,20 @@ static const unsigned char ramp[TH_N][2][3] = {
     { {244,236,216}, { 91, 64, 40} },   /* sepia: cream page, brown ink */
     { { 24, 24, 26}, {212,212,208} },   /* dark: near-black page, warm grey ink */
 };
+static uint16_t theme_lut[TH_N][256];
 static inline uint16_t rgb565(int r, int g, int b) {
     return (uint16_t)(((r&0xF8)<<8)|((g&0xFC)<<3)|(b>>3));
+}
+static void themes_init(void) {
+    for (int t = TH_SEPIA; t < TH_N; t++) {
+        const unsigned char *bg = ramp[t][0], *ink = ramp[t][1];
+        for (int L = 0; L < 256; L++) {
+            int r = ink[0] + (bg[0]-ink[0])*L/255;
+            int g = ink[1] + (bg[1]-ink[1])*L/255;
+            int b = ink[2] + (bg[2]-ink[2])*L/255;
+            theme_lut[t][L] = rgb565(r, g, b);
+        }
+    }
 }
 static uint16_t bg565(void) {
     const unsigned char *p = ramp[theme][0];
@@ -157,12 +176,10 @@ static void pix_to_fb(const fz_pixmap *pix) {
             int r = s[0], g = s[1], b = s[2];
             if (theme != TH_LIGHT) {
                 int L = (r*77 + g*150 + b*29) >> 8;      /* luma 0..255 */
-                const unsigned char *bg = ramp[theme][0], *ink = ramp[theme][1];
-                r = ink[0] + (bg[0]-ink[0])*L/255;
-                g = ink[1] + (bg[1]-ink[1])*L/255;
-                b = ink[2] + (bg[2]-ink[2])*L/255;
+                d[x] = theme_lut[theme][L];
+            } else {
+                d[x] = rgb565(r, g, b);
             }
-            d[x] = rgb565(r, g, b);
             s += pix->n;
         }
     }
@@ -183,7 +200,6 @@ static void render_page(void) {
         pix_to_fb(pix);
     } fz_always(ctx) { if (pix) fz_drop_pixmap(ctx, pix); }
     fz_catch(ctx) { fz_report_error(ctx); memset(FB, 0xFF, (size_t)PW*PH*2); }
-    present();
 }
 
 static void reflow(void) {
@@ -199,6 +215,18 @@ static void reflow(void) {
 
 /* ---- progress persistence -------------------------------------------------- */
 static char pos_path[1100];
+static int pos_dirty;
+static uint64_t pos_changed_ms, pos_last_save_ms;
+
+static uint64_t ticks_ms(void) {
+    struct timeval tv;
+    if (gettimeofday(&tv, NULL) != 0) return 0;
+    return (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
+}
+static void pos_mark_dirty(void) {
+    pos_dirty = 1;
+    pos_changed_ms = ticks_ms();
+}
 static void pos_init(const char *book) { snprintf(pos_path, sizeof pos_path, "%s.pos", book); }
 static void pos_load(void) {
     FILE *f = fopen(pos_path, "r");
@@ -212,10 +240,18 @@ static void pos_load(void) {
     fclose(f);
 }
 static void pos_save(void) {
-    FILE *f = fopen(pos_path, "w");
+    char tmp[sizeof pos_path + 5];
+    snprintf(tmp, sizeof tmp, "%s.tmp", pos_path);
+    FILE *f = fopen(tmp, "w");
     if (!f) return;
-    fprintf(f, "%d %d %d %d\n", page, font_px, font_sel, theme);
-    fclose(f);
+    int ok = fprintf(f, "%d %d %d %d\n", page, font_px, font_sel, theme) > 0;
+    if (fclose(f) != 0) ok = 0;
+    if (!ok || rename(tmp, pos_path) != 0) {
+        unlink(tmp);
+        return;
+    }
+    pos_dirty = 0;
+    pos_last_save_ms = ticks_ms();
 }
 
 /* ---- menu ------------------------------------------------------------------
@@ -288,14 +324,16 @@ static int menu_loop(void) {
             int dir = (pr & BIT(K_RIGHT)) ? 1 : -1;
             if (sel == M_SIZE) {
                 int np = font_px + dir*2;
-                if (np >= PX_MIN && np <= PX_MAX) { font_px = np; dirty = 1; redraw = 1; }
+                if (np >= PX_MIN && np <= PX_MAX) {
+                    font_px = np; dirty = 1; redraw = 1; pos_mark_dirty();
+                }
             } else if (sel == M_FONT) {
                 font_sel = (font_sel + dir + font_count) % font_count;
-                apply_font(); dirty = 1; redraw = 1;   /* CSS now, reflow on close */
+                apply_font(); dirty = 1; redraw = 1; pos_mark_dirty();
             } else if (sel == M_THEME) {
                 theme = (theme + dir + TH_N) % TH_N;   /* color only: no reflow,
                                                           page re-renders on close */
-                redraw = 1;
+                redraw = 1; pos_mark_dirty();
             }
         }
 
@@ -304,10 +342,10 @@ static int menu_loop(void) {
         if (pr & BIT(K_A)) {
             switch (sel) {
             case M_RESUME: MENU_CLOSE();
-            case M_FWD:   page += count/10 + 1; if (page>=count) page=count-1; MENU_CLOSE();
-            case M_BACK:  page -= count/10 + 1; if (page<0) page=0; MENU_CLOSE();
-            case M_START: page = 0; MENU_CLOSE();
-            case M_END:   page = count-1; MENU_CLOSE();
+            case M_FWD:   page += count/10 + 1; if (page>=count) page=count-1; pos_mark_dirty(); MENU_CLOSE();
+            case M_BACK:  page -= count/10 + 1; if (page<0) page=0; pos_mark_dirty(); MENU_CLOSE();
+            case M_START: page = 0; pos_mark_dirty(); MENU_CLOSE();
+            case M_END:   page = count-1; pos_mark_dirty(); MENU_CLOSE();
             case M_QUIT:  free(bg); pos_save(); return 1;
             default: break;   /* value rows: A does nothing */
             }
@@ -337,8 +375,9 @@ int main(int argc, char **argv) {
     if (!FB) return 1;
     splash("Loading...");
 
-    ctx = fz_new_context(NULL, NULL, FZ_STORE_UNLIMITED);
+    ctx = fz_new_context(NULL, NULL, EBOOK_STORE_BYTES);
     if (!ctx) return 1;
+    themes_init();
     fonts_init();
     fz_try(ctx) {
         fz_register_document_handlers(ctx);
@@ -355,7 +394,7 @@ int main(int argc, char **argv) {
     }
     if (page >= count) page = count-1; if (page < 0) page = 0;
 
-    int need_draw = 1, save_ctr = 0;
+    int need_draw = 1;
     uint32_t prev = keys();
     for (;;) {
         if (need_draw) { need_draw = 0; render_page(); draw_status(); present(); }
@@ -374,7 +413,14 @@ int main(int argc, char **argv) {
         if (pr & (BIT(K_L1)|BIT(K_LEFT)|BIT(K_B)))  { if (page>0){ page--; moved=1; } }
         if (pr & BIT(K_R2)) { page += count/10 + 1; if (page>=count) page=count-1; moved=1; }
         if (pr & BIT(K_L2)) { page -= count/10 + 1; if (page<0) page=0; moved=1; }
-        if (moved) { need_draw = 1; if (++save_ctr >= 3) { pos_save(); save_ctr = 0; } }
+        if (moved) { need_draw = 1; pos_mark_dirty(); }
+
+        /* Do not write to the FAT card while the user is flipping pages. Save
+         * after navigation settles, and never more than once every five seconds. */
+        uint64_t now = ticks_ms();
+        if (pos_dirty && now - pos_changed_ms >= 5000 &&
+            now - pos_last_save_ms >= 5000)
+            pos_save();
 
         usleep(15000);
     }
