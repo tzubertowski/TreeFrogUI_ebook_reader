@@ -12,7 +12,7 @@
  *   START            -> (in menu) not used; SELECT+START anytime -> quit+save
  * Menu (SELECT): UP/DOWN move, A select, B/SELECT close.
  *
- * Progress is saved to "<book>.pos" (page + font size) and restored on open.
+ * Progress is saved under a hidden ".positions" directory beside the book.
  */
 #include <mupdf/fitz.h>
 #include <stdio.h>
@@ -23,6 +23,8 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <strings.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <sys/time.h>
@@ -38,6 +40,13 @@ enum { K_SELECT=0, K_START=3, K_UP=4, K_RIGHT=5, K_DOWN=6, K_LEFT=7,
 static volatile uint32_t *g_keys;
 static int   PW = 854, PH = 480;       /* panel pixels */
 static uint16_t *FB;                    /* PW*PH RGB565 */
+
+#define UIS 3   /* 8x8 UI font scale at 1280x720 (24px glyphs -> ~12px on panel) */
+#define STATUS_BAR_HEIGHT (8*UIS + 6)
+static int reading_height(void) {
+    int h = PH - STATUS_BAR_HEIGHT;
+    return h > 0 ? h : PH;
+}
 
 static void input_init(void) {
     key_t k = ftok("/tmp/joy_key", 'a');
@@ -166,7 +175,8 @@ static uint16_t bg565(void) {
     return theme == TH_LIGHT ? 0xFFFF : rgb565(p[0], p[1], p[2]);
 }
 static void pix_to_fb(const fz_pixmap *pix) {
-    int W = pix->w < PW ? pix->w : PW, H = pix->h < PH ? pix->h : PH;
+    int W = pix->w < PW ? pix->w : PW;
+    int H = pix->h < reading_height() ? pix->h : reading_height();
     uint16_t fill = bg565();
     for (size_t i = 0; i < (size_t)PW*PH; i++) FB[i] = fill;
     for (int y = 0; y < H; y++) {
@@ -186,7 +196,6 @@ static void pix_to_fb(const fz_pixmap *pix) {
 }
 static void present(void) { hwdisp_present(FB, PW, PH, PW*2); }
 
-#define UIS 3   /* 8x8 UI font scale at 1280x720 (24px glyphs -> ~12px on panel) */
 static void splash(const char *msg) {
     memset(FB, 0x00, (size_t)PW*PH*2);
     put_text(PW/2 - (int)strlen(msg)*4*UIS, PH/2 - 4*UIS, UIS, msg, 0xFFFF);
@@ -206,7 +215,7 @@ static void reflow(void) {
     splash("Reflowing...");
     float frac = count > 1 ? (float)page/(count-1) : 0;
     fz_try(ctx) {
-        fz_layout_document(ctx, doc, (float)PW, (float)PH, em_from_px());
+        fz_layout_document(ctx, doc, (float)PW, (float)reading_height(), em_from_px());
         count = fz_count_pages(ctx, doc);
     } fz_catch(ctx) { fz_report_error(ctx); }
     page = (int)(frac*(count-1)+0.5f);
@@ -215,6 +224,7 @@ static void reflow(void) {
 
 /* ---- progress persistence -------------------------------------------------- */
 static char pos_path[1100];
+static char legacy_pos_path[1100];
 static int pos_dirty;
 static uint64_t pos_changed_ms, pos_last_save_ms;
 
@@ -227,9 +237,40 @@ static void pos_mark_dirty(void) {
     pos_dirty = 1;
     pos_changed_ms = ticks_ms();
 }
-static void pos_init(const char *book) { snprintf(pos_path, sizeof pos_path, "%s.pos", book); }
+static void pos_init(const char *book) {
+    const char *base = strrchr(book, '/');
+    size_t dir_len = base ? (size_t)(base - book) : 0;
+    base = base ? base + 1 : book;
+
+    snprintf(legacy_pos_path, sizeof legacy_pos_path, "%s.pos", book);
+    if (dir_len > 0)
+        snprintf(pos_path, sizeof pos_path, "%.*s/.positions/%s.pos",
+                 (int)dir_len, book, base);
+    else
+        snprintf(pos_path, sizeof pos_path, ".positions/%s.pos", base);
+
+    char dir[1100];
+    if (dir_len > 0)
+        snprintf(dir, sizeof dir, "%.*s/.positions", (int)dir_len, book);
+    else
+        snprintf(dir, sizeof dir, ".positions");
+
+    if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
+        /* Read-only or otherwise unusable directory: retain the old location
+         * so progress still works, even though it cannot be hidden. */
+        snprintf(pos_path, sizeof pos_path, "%s", legacy_pos_path);
+        return;
+    }
+
+    /* Move an existing sidecar out of the book list. Same-filesystem rename is
+     * atomic. pos_load() still falls back to it if migration is not possible. */
+    if (access(pos_path, F_OK) != 0 && access(legacy_pos_path, F_OK) == 0)
+        rename(legacy_pos_path, pos_path);
+}
 static void pos_load(void) {
     FILE *f = fopen(pos_path, "r");
+    if (!f && strcmp(pos_path, legacy_pos_path) != 0)
+        f = fopen(legacy_pos_path, "r");
     if (!f) return;
     int p, px = 0, fs = 0, th = 0;
     int n = fscanf(f, "%d %d %d %d", &p, &px, &fs, &th);
@@ -250,6 +291,8 @@ static void pos_save(void) {
         unlink(tmp);
         return;
     }
+    if (strcmp(pos_path, legacy_pos_path) != 0)
+        unlink(legacy_pos_path);
     pos_dirty = 0;
     pos_last_save_ms = ticks_ms();
 }
@@ -265,7 +308,7 @@ static void draw_status(void) {
     char s[96];
     int pct = count > 1 ? page*100/(count-1) : 100;
     snprintf(s, sizeof s, "Page %d / %d   %d%%   [SELECT] menu", page+1, count, pct);
-    int bh = 8*UIS + 6;
+    int bh = STATUS_BAR_HEIGHT;
     fill_rect(0, PH-bh, PW, bh, 0x0000);
     put_text(6, PH-bh+3, UIS, s, 0xFFFF);
 }
@@ -385,7 +428,7 @@ int main(int argc, char **argv) {
         pos_init(path);
         pos_load();                         /* may set font_px + font_sel first */
         apply_font();
-        fz_layout_document(ctx, doc, (float)PW, (float)PH, em_from_px());
+        fz_layout_document(ctx, doc, (float)PW, (float)reading_height(), em_from_px());
         count = fz_count_pages(ctx, doc);
     } fz_catch(ctx) {
         fz_report_error(ctx);

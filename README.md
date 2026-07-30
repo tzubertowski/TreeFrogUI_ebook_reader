@@ -30,7 +30,9 @@ the book path as its argument.
 
 Menu: UP/DOWN move; on **Text size** / **Font** rows LEFT/RIGHT change the value
 (applied when you close the menu); **A** runs action rows. Reading position,
-font size and font face are saved per book in a `<book>.pos` sidecar.
+font size and font face are saved per book under a hidden `.positions/`
+subdirectory beside the books. Older `<book>.pos` sidecars are migrated when
+the book is opened.
 
 ### Fonts
 
