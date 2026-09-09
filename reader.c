@@ -27,7 +27,7 @@
 #include <sys/stat.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
-#include <sys/time.h>
+#include <time.h>
 
 #include "port_sf3000/hwdisp.h"
 #include "font8x8.h"
@@ -83,6 +83,7 @@ static void fill_rect(int x, int y, int w, int h, uint16_t col) {
 
 /* ---- MuPDF ----------------------------------------------------------------- */
 static fz_context *ctx;
+static fz_colorspace *rgb;
 static fz_document *doc;
 static int page = 0, count = 1;
 
@@ -181,7 +182,7 @@ static void pix_to_fb(const fz_pixmap *pix) {
     for (size_t i = 0; i < (size_t)PW*PH; i++) FB[i] = fill;
     for (int y = 0; y < H; y++) {
         const unsigned char *s = pix->samples + (size_t)y*pix->stride;
-        uint16_t *d = FB + (size_t)y*PW;
+        uint16_t *d = FB + (size_t)y*PW + (PW - W)/2;
         for (int x = 0; x < W; x++) {
             int r = s[0], g = s[1], b = s[2];
             if (theme != TH_LIGHT) {
@@ -203,9 +204,11 @@ static void splash(const char *msg) {
 }
 
 static void render_page(void) {
+    if (page >= count) page = count - 1;
+    if (page < 0) page = 0;
     fz_pixmap *pix = NULL;
     fz_try(ctx) {
-        pix = fz_new_pixmap_from_page_number(ctx, doc, page, fz_scale(1,1), fz_device_rgb(ctx), 0);
+        pix = fz_new_pixmap_from_page_number(ctx, doc, page, fz_scale(1,1), rgb, 0);
         pix_to_fb(pix);
     } fz_always(ctx) { if (pix) fz_drop_pixmap(ctx, pix); }
     fz_catch(ctx) { fz_report_error(ctx); memset(FB, 0xFF, (size_t)PW*PH*2); }
@@ -229,9 +232,9 @@ static int pos_dirty;
 static uint64_t pos_changed_ms, pos_last_save_ms;
 
 static uint64_t ticks_ms(void) {
-    struct timeval tv;
-    if (gettimeofday(&tv, NULL) != 0) return 0;
-    return (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 static void pos_mark_dirty(void) {
     pos_dirty = 1;
@@ -334,6 +337,7 @@ static int menu_loop(void) {
     /* Render page + dim into a bg buffer once (the dimmed page is just backdrop;
      * size/font changes only reflow when you LEAVE the menu, not per keypress). */
     uint16_t *bg = malloc((size_t)PW*PH*2);
+    if (!bg) return 1;
     render_page();
     if (bg) for (int i = 0; i < PW*PH; i++) bg[i] = (FB[i] >> 1) & 0x7BEF;
     const int rowh = 8*UIS + 12;
@@ -420,6 +424,7 @@ int main(int argc, char **argv) {
 
     ctx = fz_new_context(NULL, NULL, EBOOK_STORE_BYTES);
     if (!ctx) return 1;
+    rgb = fz_device_rgb(ctx);
     themes_init();
     fonts_init();
     fz_try(ctx) {
