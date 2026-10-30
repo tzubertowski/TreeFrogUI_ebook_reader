@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <dirent.h>
@@ -40,6 +41,7 @@ enum { K_SELECT=0, K_START=3, K_UP=4, K_RIGHT=5, K_DOWN=6, K_LEFT=7,
 static volatile uint32_t *g_keys;
 static int   PW = 854, PH = 480;       /* panel pixels */
 static uint16_t *FB;                    /* PW*PH RGB565 */
+static int pdf_document, pdf_zoom, pdf_pan_x, pdf_pan_y;
 
 #define UIS 3   /* 8x8 UI font scale at 1280x720 (24px glyphs -> ~12px on panel) */
 #define STATUS_BAR_HEIGHT (8*UIS + 6)
@@ -207,10 +209,35 @@ static void render_page(void) {
     if (page >= count) page = count - 1;
     if (page < 0) page = 0;
     fz_pixmap *pix = NULL;
+    fz_page *p = NULL;
+    fz_device *dev = NULL;
     fz_try(ctx) {
-        pix = fz_new_pixmap_from_page_number(ctx, doc, page, fz_scale(1,1), rgb, 0);
+        if (pdf_document) {
+            fz_rect bounds;
+            float scale;
+            int h = reading_height();
+            p = fz_load_page(ctx, doc, page);
+            bounds = fz_bound_page(ctx, p);
+            scale = fminf((float)PW / (bounds.x1 - bounds.x0), (float)h / (bounds.y1 - bounds.y0));
+            scale *= 1.0f + pdf_zoom * 0.5f;
+            pix = fz_new_pixmap_with_bbox(ctx, rgb, (fz_irect){0, 0, PW, h}, NULL, 0);
+            memset(pix->samples, 0xff, (size_t)pix->stride * pix->h);
+            {
+                float tx = (PW - (bounds.x1 - bounds.x0) * scale) * 0.5f - bounds.x0 * scale - pdf_pan_x;
+                float ty = (h - (bounds.y1 - bounds.y0) * scale) * 0.5f - bounds.y0 * scale - pdf_pan_y;
+                dev = fz_new_draw_device(ctx, fz_identity, pix);
+                fz_run_page(ctx, p, dev, (fz_matrix){scale, 0, 0, scale, tx, ty}, NULL);
+                fz_close_device(ctx, dev);
+            }
+        } else {
+            pix = fz_new_pixmap_from_page_number(ctx, doc, page, fz_scale(1,1), rgb, 0);
+        }
         pix_to_fb(pix);
-    } fz_always(ctx) { if (pix) fz_drop_pixmap(ctx, pix); }
+    } fz_always(ctx) {
+        if (dev) fz_drop_device(ctx, dev);
+        if (pix) fz_drop_pixmap(ctx, pix);
+        if (p) fz_drop_page(ctx, p);
+    }
     fz_catch(ctx) { fz_report_error(ctx); memset(FB, 0xFF, (size_t)PW*PH*2); }
 }
 
@@ -310,7 +337,10 @@ enum { M_SIZE, M_FONT, M_THEME, M_RESUME, M_FWD, M_BACK, M_START, M_END, M_QUIT,
 static void draw_status(void) {
     char s[96];
     int pct = count > 1 ? page*100/(count-1) : 100;
-    snprintf(s, sizeof s, "Page %d / %d   %d%%   [SELECT] menu", page+1, count, pct);
+    if (pdf_document)
+        snprintf(s, sizeof s, "Pg %d/%d %d%% %.1fx SELECT menu", page+1, count, pct, 1.0f + pdf_zoom * 0.5f);
+    else
+        snprintf(s, sizeof s, "Page %d / %d   %d%%   [SELECT] menu", page+1, count, pct);
     int bh = STATUS_BAR_HEIGHT;
     fill_rect(0, PH-bh, PW, bh, 0x0000);
     put_text(6, PH-bh+3, UIS, s, 0xFFFF);
@@ -425,6 +455,10 @@ int main(int argc, char **argv) {
     ctx = fz_new_context(NULL, NULL, EBOOK_STORE_BYTES);
     if (!ctx) return 1;
     rgb = fz_device_rgb(ctx);
+    {
+        const char *dot = strrchr(path, '.');
+        pdf_document = dot && strcasecmp(dot, ".pdf") == 0;
+    }
     themes_init();
     fonts_init();
     fz_try(ctx) {
@@ -457,10 +491,24 @@ int main(int argc, char **argv) {
             continue;
         }
         int moved = 0;
-        if (pr & (BIT(K_R1)|BIT(K_RIGHT)|BIT(K_A))) { if (page<count-1){ page++; moved=1; } }
-        if (pr & (BIT(K_L1)|BIT(K_LEFT)|BIT(K_B)))  { if (page>0){ page--; moved=1; } }
-        if (pr & BIT(K_R2)) { page += count/10 + 1; if (page>=count) page=count-1; moved=1; }
-        if (pr & BIT(K_L2)) { page -= count/10 + 1; if (page<0) page=0; moved=1; }
+        if (pdf_document && (pr & (BIT(K_X)|BIT(K_Y)))) {
+            int next = pdf_zoom + ((pr & BIT(K_X)) ? 1 : -1);
+            if (next < 0) next = 0;
+            if (next > 4) next = 4;
+            if (next != pdf_zoom) { pdf_zoom = next; pdf_pan_x = pdf_pan_y = 0; moved = 1; }
+        }
+        if (pdf_document && pdf_zoom > 0 &&
+            (pr & (BIT(K_UP)|BIT(K_DOWN)|BIT(K_LEFT)|BIT(K_RIGHT)))) {
+            if (pr & BIT(K_UP)) pdf_pan_y -= 48;
+            if (pr & BIT(K_DOWN)) pdf_pan_y += 48;
+            if (pr & BIT(K_LEFT)) pdf_pan_x -= 48;
+            if (pr & BIT(K_RIGHT)) pdf_pan_x += 48;
+            moved = 1;
+        }
+        if (pr & (BIT(K_R1)|((!pdf_document || !pdf_zoom) ? BIT(K_RIGHT) : 0)|BIT(K_A))) { if (page<count-1){ page++; moved=1; pdf_pan_x=pdf_pan_y=0; } }
+        if (pr & (BIT(K_L1)|((!pdf_document || !pdf_zoom) ? BIT(K_LEFT) : 0)|BIT(K_B)))  { if (page>0){ page--; moved=1; pdf_pan_x=pdf_pan_y=0; } }
+        if (pr & BIT(K_R2)) { page += count/10 + 1; if (page>=count) page=count-1; pdf_pan_x=pdf_pan_y=0; moved=1; }
+        if (pr & BIT(K_L2)) { page -= count/10 + 1; if (page<0) page=0; pdf_pan_x=pdf_pan_y=0; moved=1; }
         if (moved) { need_draw = 1; pos_mark_dirty(); }
 
         /* Do not write to the FAT card while the user is flipping pages. Save
