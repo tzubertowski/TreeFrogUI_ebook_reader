@@ -494,7 +494,7 @@ int main(int argc, char **argv) {
         if (pdf_document && (pr & (BIT(K_X)|BIT(K_Y)))) {
             int next = pdf_zoom + ((pr & BIT(K_X)) ? 1 : -1);
             if (next < 0) next = 0;
-            if (next > 4) next = 4;
+            if (next > 8) next = 8;
             if (next != pdf_zoom) { pdf_zoom = next; pdf_pan_x = pdf_pan_y = 0; moved = 1; }
         }
         if (pdf_document && pdf_zoom > 0 &&
